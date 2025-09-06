@@ -1,0 +1,87 @@
+name: Deploy HDMI City Dwellers
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        
+    - name: Add server to known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+        
+    - name: Deploy to server
+      run: |
+        # Create deployment package
+        tar -czf hdmi-city-dwellers.tar.gz \
+          --exclude='.git' \
+          --exclude='node_modules' \
+          --exclude='__pycache__' \
+          --exclude='.env' \
+          .
+          
+        # Copy to server
+        scp hdmi-city-dwellers.tar.gz ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:~/
+        
+        # Deploy on server
+        ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          # Navigate to project directory
+          cd /opt/hdmi-city-dwellers || { echo "Project directory not found. Run initial setup first."; exit 1; }
+          
+          # Stop services
+          docker-compose down
+          
+          # Backup current deployment
+          cp -r . ../hdmi-city-dwellers-backup-$(date +%Y%m%d_%H%M%S) || true
+          
+          # Extract new files
+          tar -xzf ~/hdmi-city-dwellers.tar.gz
+          
+          # Preserve environment file
+          if [ -f ../hdmi-city-dwellers-backup-*/env ]; then
+            cp ../hdmi-city-dwellers-backup-*/.env . || true
+          fi
+          
+          # Build and start services
+          docker-compose build --no-cache
+          docker-compose up -d
+          
+          # Wait for services
+          sleep 30
+          
+          # Health check
+          if curl -f http://localhost:8000/health > /dev/null 2>&1; then
+            echo "✅ Deployment successful - services are healthy"
+            # Cleanup old backups (keep last 3)
+            ls -dt ../hdmi-city-dwellers-backup-* | tail -n +4 | xargs rm -rf || true
+          else
+            echo "❌ Deployment failed - services not healthy"
+            exit 1
+          fi
+          
+          # Cleanup deployment package
+          rm ~/hdmi-city-dwellers.tar.gz
+        EOF
+        
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "🎉 Deployment to ${{ secrets.SERVER_HOST }} completed successfully!"
+        else
+          echo "❌ Deployment to ${{ secrets.SERVER_HOST }} failed!"
+        fi
